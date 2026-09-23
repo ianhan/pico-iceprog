@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13...3.27)
 
-set(PROJECT pico_mpsse)
+set(PROJECT pico_iceprog)
 
 # Pull in SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -10,7 +10,7 @@ project(pico_mpsse)
 pico_sdk_init()
 
 add_executable(${PROJECT}
-        ${PROJECT}.c
+        pico_mpsse.c
 	pio_jtag.c
 )
 
@@ -44,4 +44,3 @@ add_custom_target(reset
 add_custom_target(term
     COMMAND term.sh /dev/ttyACM0 115200
 )
-

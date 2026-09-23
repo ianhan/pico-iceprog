@@ -37,6 +37,8 @@ typedef struct pio_jtag_inst {
 void pio_jtag_init(pio_jtag_inst_t* jtag, uint freq);
 void pio_jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz);
 void pio_set_outputs(pio_jtag_inst_t *jtag, uint8_t bits);
+void pio_jtag_wait(pio_jtag_inst_t *jtag);
+void pio_jtag_clock(pio_jtag_inst_t *jtag, size_t bits);
 
 // convenience and support functions
 void pio_jtag_enable(pio_jtag_inst_t* jtag, bool enable); 

@@ -21,6 +21,7 @@
 #include "hardware/structs/usb.h" // USB hardware struct definitions from pico-sdk
 #include "hardware/irq.h"         // For interrupt enable and numbers
 #include "hardware/resets.h"      // For resetting the USB controller
+#include "pico/platform.h"
 #include "pico_mpsse.h"           // Device descriptors
 
 #include "hardware/clocks.h"      // To adjust system clock to allow for 6Mhz
@@ -59,6 +60,7 @@ void ep4_out_handler(uint8_t *buf, uint16_t len);
 
 // Global device address
 static bool should_set_address = false;
+static bool ep0_request_in = false;
 static uint8_t dev_addr = 0;
 static volatile bool configured = false;
 
@@ -100,11 +102,12 @@ static uint8_t ep0_buf[64];
 #endif
 
 static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
-  // check if any direction bits have changed at all
-  if(dir == jtag->pio.gpio_dir) return;
+  // Complete queued SPI clocks before changing CS, reset or pin ownership.
+  pio_jtag_wait(&jtag->pio);
+  jtag->pio.gpio_dir = dir;
 
-  // enable the PIO if the direction of the lower four port pins matches the JTAG/SPI use case
-  pio_jtag_enable(&jtag->pio, (dir & 0x0f) == 0x0b);
+  // Both SPI (D3 input) and JTAG (D3 output) use D0/D1 out and D2 in.
+  pio_jtag_enable(&jtag->pio, jtag->mode == MODE_MPSSE && (dir & 0x07) == 0x03);
 
   // set lower pins direction if not in pio mode
   if(!jtag->pio.pio_enabled) {
@@ -119,19 +122,19 @@ static void port_gpio_set_dir(struct jtag *jtag, uint8_t dir) {
 
   // handle upper bits
   for(int i=0;i<4;i++) {
-    if(jtag->pio.pins_upper[i]) {
+    if(jtag->pio.pins_upper[i] != (uint)-1) {
       gpio_set_dir(jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?GPIO_OUT:GPIO_IN);
 #ifdef DEBUG_GPIO
       printf("#%d GPIO%d DIR = %s\n", i+4, jtag->pio.pins_upper[i], (dir&(1<<(i+4)))?"output":"input");
 #endif	  
     }
   }    
-  jtag->pio.gpio_dir = dir;
 }
 
 static void port_gpio_set(struct jtag *jtag, uint8_t value) {
-  // PIO is only used in JTAG/SPI compatible mode with direction of D0-D3 being 0x0b
-  if(jtag->pio.pio_enabled) {      
+  // Preload both PIO and SIO output latches, including pins currently inputs.
+  // iceprog asserts CS/reset by changing direction while the latch stays low.
+  {
     // this command also sets a certain state to the lower output pins
     uint8_t ostate = 0;
     if(value & (1<<0)) ostate |= PIO_JTAG_BIT_TCK;
@@ -142,29 +145,25 @@ static void port_gpio_set(struct jtag *jtag, uint8_t value) {
     printf("PIO GPIO = %d\n", ostate);
 #endif
     pio_set_outputs(&jtag->pio, ostate);
-  } else {
-    // pio not active, set lower GPIO directly
+  }
+  {
+    // SIO latches are also needed when a pin changes back from PIO to GPIO.
     uint8_t low_pins[] = { jtag->pio.pin_tck, jtag->pio.pin_tdi, jtag->pio.pin_tdo, jtag->pio.pin_tms };
     for(int i=0;i<4;i++) {
-      if(jtag->pio.gpio_dir & (1<<i)) {
 #ifdef DEBUG_GPIO
-	printf("#%d GPIO%d = %d\n", i, low_pins[i], (value<<i)?1:0);
+	printf("#%d GPIO%d = %d\n", i, low_pins[i], (value&(1<<i))?1:0);
 #endif
-	gpio_put(low_pins[i], (value<<i)?1:0);
-      }
+	gpio_put(low_pins[i], (value&(1<<i))?1:0);
     }
   }
     
   // handle upper gpio if present
   for(int i=0;i<4;i++) {
-    if(jtag->pio.pins_upper[i]) {
-      // set value id pin is configured as output
-      if(jtag->pio.gpio_dir & (1<<(i+4))) {
+    if(jtag->pio.pins_upper[i] != (uint)-1) {
 	gpio_put(jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);
 #ifdef DEBUG_GPIO
 	printf("#%d GPIO%d = %d\n", i+4, jtag->pio.pins_upper[i], (value&(1<<(i+4)))?1:0);	    
 #endif
-      }
     }
 #ifdef DEBUG_GPIO
     else printf("\n");
@@ -173,6 +172,7 @@ static void port_gpio_set(struct jtag *jtag, uint8_t value) {
 }
 
 static uint8_t port_gpio_get(struct jtag *jtag) {
+  pio_jtag_wait(&jtag->pio);
   uint8_t low_pins[] = { jtag->pio.pin_tck, jtag->pio.pin_tdi, jtag->pio.pin_tdo, jtag->pio.pin_tms };
   uint8_t retval = 0;
 
@@ -209,6 +209,7 @@ static struct usb_device_configuration dev_config = {
 	.ports[0].jtag.tx_pending = false,
 	.ports[0].jtag.rx_disabled = false,
 	.ports[0].jtag.cmd_buf.len = 0,
+	.ports[0].jtag.latency_timer = 16,
 	.ports[0].interface_descriptor = &interface_descriptor_p0,
 	.ports[0].endpoints = { {
 	    .descriptor = &ep1_in,
@@ -238,6 +239,7 @@ static struct usb_device_configuration dev_config = {
 	.ports[1].jtag.tx_pending = false,
 	.ports[1].jtag.rx_disabled = false,
 	.ports[1].jtag.cmd_buf.len = 0,
+	.ports[1].jtag.latency_timer = 16,
 	.ports[1].interface_descriptor = &interface_descriptor_p1,
 	.ports[1].endpoints = { {
 	    .descriptor = &ep3_in,
@@ -344,7 +346,7 @@ uint8_t usb_prepare_string_descriptor(const unsigned char *str) {
  * @return uint32_t
  */
 static inline uint32_t usb_buffer_offset(volatile uint8_t *buf) {
-    return (uint32_t) buf ^ (uint32_t) usb_dpram;
+    return (uint32_t)((uintptr_t)buf - (uintptr_t)usb_dpram);
 }
 
 /**
@@ -452,7 +454,7 @@ void usb_start_transfer(struct usb_endpoint_configuration *ep, uint8_t *buf, uin
 
     if (ep_is_tx(ep)) {
         // Need to copy the data from the user buffer to the usb memory
-        memcpy((void *) ep->data_buffer, (void *) buf, len);
+        if(len) memcpy((void *) ep->data_buffer, (void *) buf, len);
         // Mark as full
         val |= USB_BUF_CTRL_FULL;
     }
@@ -461,7 +463,60 @@ void usb_start_transfer(struct usb_endpoint_configuration *ep, uint8_t *buf, uin
     val |= ep->next_pid ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID;
     ep->next_pid ^= 1u;
 
+    // RP2040 datasheet 4.1.2.5.1: prepare the buffer before handing it to USB.
+    *ep->buffer_control = val & ~USB_BUF_CTRL_AVAIL;
+    busy_wait_at_least_cycles(12);
     *ep->buffer_control = val;
+}
+
+static void check_for_outgoing_data(struct jtag *jtag);
+
+// Cancel a queued packet without resetting the USB data toggle. SIO purge is
+// not a USB endpoint reset. ABORT is supported by RP2040 B2 and later (E2).
+static void usb_cancel_transfer(struct usb_endpoint_configuration *ep) {
+  uint8_t addr = ep->descriptor->bEndpointAddress;
+  uint32_t mask = 1u << (2 * (addr & 0x0f) + ((addr & USB_DIR_IN)?0:1));
+  bool available = (*ep->buffer_control & USB_BUF_CTRL_AVAIL) != 0;
+  if(available && rp2040_chip_version() >= 2) {
+    usb_hw_set->abort = mask;
+    while(!(usb_hw->abort_done & mask)) tight_loop_contents();
+  }
+  // next_pid was advanced when queued. Roll it back only if not consumed.
+  if(*ep->buffer_control & USB_BUF_CTRL_AVAIL) ep->next_pid ^= 1u;
+  *ep->buffer_control = 0;
+  usb_hw_clear->buf_status = mask;
+  if(available && rp2040_chip_version() >= 2) {
+    usb_hw_clear->abort_done = mask;
+    usb_hw_clear->abort = mask;
+  }
+}
+
+static void port_purge(struct jtag *jtag, bool rx, bool tx) {
+  if(rx) {
+    usb_cancel_transfer(usb_get_endpoint_configuration(jtag->eps[0]));
+    jtag->reply_len = 0;
+    jtag->tx_pending = false;
+    check_for_outgoing_data(jtag);
+  }
+  if(tx || (rx && jtag->rx_disabled)) {
+    usb_cancel_transfer(usb_get_endpoint_configuration(jtag->eps[1]));
+    jtag->rx_disabled = false;
+    usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[1]), NULL, MAX_PKT_SIZE);
+  }
+  if(tx) {
+    jtag->pending_writes = 0;
+    jtag->cmd_buf.len = 0;
+  }
+}
+
+static void port_reset(struct jtag *jtag) {
+  jtag->mode = 0;
+  port_gpio_set_dir(jtag, 0);
+  jtag->pending_writes = 0;
+  jtag->cmd_buf.len = 0;
+  jtag->reply_len = 0;
+  jtag->tx_pending = false;
+  jtag->rx_disabled = false;
 }
 
 /**
@@ -516,7 +571,7 @@ void usb_handle_config_descriptor(volatile struct usb_setup_packet *pkt) {
 
     // Send data
     // Get len by working out end of buffer subtract start of buffer
-    uint32_t len = (uint32_t) buf - (uint32_t) &ep0_buf[0];
+    uint32_t len = buf - &ep0_buf[0];
     usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), &ep0_buf[0], MIN(len, pkt->wLength));
 }
 
@@ -528,8 +583,22 @@ void usb_bus_reset(void) {
     // Set address back to 0
     dev_addr = 0;
     should_set_address = false;
+    ep0_request_in = false;
     usb_hw->dev_addr_ctrl = 0;
     configured = false;
+    usb_hw_clear->buf_status = UINT32_MAX;
+    for(uint e = 0; e < 2; e++) {
+      *dev_config.endpoints[e].buffer_control = 0;
+      dev_config.endpoints[e].next_pid = 1;
+    }
+    for(uint p = 0; p < 2; p++) {
+      port_reset(&dev_config.ports[p].jtag);
+      dev_config.ports[p].jtag.latency_timer = 16;
+      for(uint e = 0; e < 2; e++) {
+        *dev_config.ports[p].endpoints[e].buffer_control = 0;
+        dev_config.ports[p].endpoints[e].next_pid = 0;
+      }
+    }
 }
 
 /**
@@ -575,11 +644,23 @@ void usb_set_device_address(volatile struct usb_setup_packet *pkt) {
  *
  * @param pkt, the setup packet from the host.
  */
-void usb_set_device_configuration(__unused volatile struct usb_setup_packet *pkt) {
+void usb_set_device_configuration(volatile struct usb_setup_packet *pkt) {
     // Only one configuration so just acknowledge the request
     printf("Device Enumerated\r\n");
     usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
-    configured = true;
+    configured = pkt->wValue == 1;
+    for(uint p = 0; p < 2; p++) {
+      struct jtag *jtag = &dev_config.ports[p].jtag;
+      for(uint e = 0; e < 2; e++) {
+        usb_cancel_transfer(&dev_config.ports[p].endpoints[e]);
+        dev_config.ports[p].endpoints[e].next_pid = 0;
+      }
+      port_reset(jtag);
+      if(configured) {
+        check_for_outgoing_data(jtag);
+        usb_start_transfer(usb_get_endpoint_configuration(jtag->eps[1]), NULL, MAX_PKT_SIZE);
+      }
+    }
 }
 
 /* handle USB status request */
@@ -595,8 +676,6 @@ void usb_handle_status_request(volatile struct usb_setup_packet *pkt) {
  * @brief Respond to a setup packet from the host.
  *
  */
-static void check_for_outgoing_data(struct jtag *jtag);
-
 /* this is a fake eeprom. It's not permanent and changes from PC */
 /* are lost after power cycle */
 static uint16_t eeprom_dummy_data[256] = { 
@@ -621,8 +700,14 @@ static uint16_t eeprom_dummy_data[256] = {
 void usb_handle_setup_packet(void) {
     volatile struct usb_setup_packet *pkt = (volatile struct usb_setup_packet *) &usb_dpram->setup_packet;
 
-    // Reset PID to 1 for EP0 IN
-    usb_get_endpoint_configuration(EP0_IN_ADDR)->next_pid = 1u;
+    // A new SETUP aborts the previous control transfer. Both the IN data/status
+    // stage and the OUT status stage start at DATA1, independently of bulk PIDs.
+    for(uint e = 0; e < 2; e++) {
+      usb_cancel_transfer(&dev_config.endpoints[e]);
+      dev_config.endpoints[e].next_pid = 1;
+    }
+    should_set_address = false;
+    ep0_request_in = (pkt->bmRequestType & USB_DIR_IN) != 0;
 
     if (pkt->bmRequestType == USB_DIR_OUT) {
         if (pkt->bRequest == USB_REQUEST_SET_ADDRESS) {
@@ -636,7 +721,9 @@ void usb_handle_setup_packet(void) {
     } else if (pkt->bmRequestType == USB_DIR_IN) {
         if (pkt->bRequest == USB_REQUEST_GET_STATUS) {
 	  usb_handle_status_request(pkt);
-	  
+        } else if (pkt->bRequest == USB_REQUEST_GET_CONFIGURATION) {
+          ep0_buf[0] = configured?1:0;
+          usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), ep0_buf, MIN(1, pkt->wLength));
         } else if (pkt->bRequest == USB_REQUEST_GET_DESCRIPTOR) {
             switch (pkt->wValue >> 8) {
                 case USB_DT_DEVICE:
@@ -675,8 +762,14 @@ void usb_handle_setup_packet(void) {
       case 0x00:
 	printf("RESET, #%d=%d\n", pkt->wIndex, pkt->wValue);
 
-	// TODO: check if this actually resets everything and returns to idle/all tristate
-	
+	if(pkt->wIndex >= 1 && pkt->wIndex <= 2) {
+	  struct jtag *jtag = &dev_config.ports[pkt->wIndex-1].jtag;
+	  if(pkt->wValue == 0) {
+	    port_reset(jtag);
+	    port_purge(jtag, true, true);
+	  } else if(pkt->wValue == 1) port_purge(jtag, true, false);
+	  else if(pkt->wValue == 2) port_purge(jtag, false, true);
+	}
 	break;
 
       case 0x01:
@@ -709,6 +802,8 @@ void usb_handle_setup_packet(void) {
 
       case 0x09:
 	printf("SET LATENCY TIMER, #%d=%d\n", pkt->wIndex, pkt->wValue);
+	if(pkt->wIndex >= 1 && pkt->wIndex <= 2 && (pkt->wValue & 0xff))
+	  dev_config.ports[pkt->wIndex-1].jtag.latency_timer = pkt->wValue & 0xff;
 	break;
 
       case 0x0b:
@@ -717,7 +812,13 @@ void usb_handle_setup_packet(void) {
 	  struct jtag *jtag = &dev_config.ports[pkt->wIndex-1].jtag;
 	  
 	  jtag->mode = pkt->wValue>>8;
-	  port_gpio_set_dir(jtag, pkt->wValue & 0xff);
+	  jtag->pending_writes = 0;
+	  jtag->cmd_buf.len = 0;
+	  // D2 is MPSSE's dedicated data input, including during iceprog's 0xff
+	  // initial mask. Do not drive the target's MISO before the first 0x80.
+	  uint8_t direction = jtag->mode?(pkt->wValue & 0xff):0;
+	  if(jtag->mode == MODE_MPSSE) direction &= ~0x04;
+	  port_gpio_set_dir(jtag, direction);
 	}
 	break;
 
@@ -742,6 +843,12 @@ void usb_handle_setup_packet(void) {
     
     else if (pkt->bmRequestType == USB_VENDOR_IN) {
       switch(pkt->bRequest) {
+      case 0x0a: // Get latency timer, required by iceprog before setting MPSSE.
+	if(pkt->wIndex >= 1 && pkt->wIndex <= 2) {
+	  ep0_buf[0] = dev_config.ports[pkt->wIndex-1].jtag.latency_timer;
+	  usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), ep0_buf, MIN(1, pkt->wLength));
+	}
+	break;
       case 0x05:
 	printf("POLL MODEM STATUS\n");
 	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), REPLY_STATUS, 2);
@@ -762,6 +869,10 @@ void usb_handle_setup_packet(void) {
 	usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), NULL, 0);
 	break;
       }
+    } else if(pkt->bmRequestType == (USB_DIR_IN | USB_REQ_TYPE_RECIPIENT_INTERFACE) &&
+              pkt->bRequest == USB_REQUEST_GET_INTERFACE) {
+      ep0_buf[0] = 0; // Both interfaces have only alternate setting zero.
+      usb_start_transfer(usb_get_endpoint_configuration(EP0_IN_ADDR), ep0_buf, MIN(1, pkt->wLength));
     } else {
       static const char *types_str[] = { "Standard", "Class", "Vendor", "Reserved" };
       static const char *recipient_str[] = { "Device", "Interface", "Endpoint", "Other" };      
@@ -850,6 +961,14 @@ void isr_usbctrl(void) {
     uint32_t status = usb_hw->ints;
     uint32_t handled = 0;
 
+    // Drop stale endpoint completions before handling a fresh SETUP after reset.
+    if (status & USB_INTS_BUS_RESET_BITS) {
+        printf("BUS RESET\n");
+        handled |= USB_INTS_BUS_RESET_BITS;
+        usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
+        usb_bus_reset();
+    }
+
     // Setup packet received
     if (status & USB_INTS_SETUP_REQ_BITS) {
         handled |= USB_INTS_SETUP_REQ_BITS;
@@ -862,14 +981,6 @@ void isr_usbctrl(void) {
     if (status & USB_INTS_BUFF_STATUS_BITS) {
         handled |= USB_INTS_BUFF_STATUS_BITS;
         usb_handle_buff_status();
-    }
-
-    // Bus is reset
-    if (status & USB_INTS_BUS_RESET_BITS) {
-        printf("BUS RESET\n");
-        handled |= USB_INTS_BUS_RESET_BITS;
-        usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
-        usb_bus_reset();
     }
 
     if (status ^ handled) {
@@ -892,9 +1003,10 @@ void ep0_in_handler(__unused uint8_t *buf, __unused uint16_t len) {
         // Set actual device address in hardware
         usb_hw->dev_addr_ctrl = dev_addr;
         should_set_address = false;
-    } else {
+    } else if(ep0_request_in) {
         // Receive a zero length status packet from the host on EP0 OUT
         struct usb_endpoint_configuration *ep = usb_get_endpoint_configuration(EP0_OUT_ADDR);
+        ep->next_pid = 1;
         usb_start_transfer(ep, NULL, 0);
     }
 
@@ -976,9 +1088,9 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag) {
     
     /* we currently only support the lower bits */
     if(!(cmd&2)) {
-      // second payload byte is direction. Lowest bits 0xb is JTAG (and SPI) mapping
-      port_gpio_set_dir(jtag, dir);
+      // Preload output latches before enabling outputs; iceprog uses open drain.
       port_gpio_set(jtag, value);
+      port_gpio_set_dir(jtag, dir);
     }
     break;
                 
@@ -1035,6 +1147,14 @@ static uint16_t mpsse_cmd_parse(struct jtag *jtag) {
     printf("MPSSE: Enable div by 5 (12MHz master clock)\n");
 #endif
     break;
+
+  case 0x8e:
+    pio_jtag_clock(&jtag->pio, (uint32_t)jtag->cmd_buf.data.cmd.b[0] + 1);
+    break;
+
+  case 0x8f:
+    pio_jtag_clock(&jtag->pio, ((uint32_t)jtag->cmd_buf.data.cmd.w + 1) * 8);
+    break;
   }
   return 0;
 }
@@ -1073,7 +1193,7 @@ static uint16_t mpsse_shift_bytes(struct jtag *jtag, uint8_t *buf, uint16_t len)
   uint8_t cmd = jtag->cmd_buf.data.cmd.code;
 
   // length is given in bytes and command length is variable
-  uint16_t shift_len = jtag->cmd_buf.data.cmd.w + 1;
+  uint32_t shift_len = (uint32_t)jtag->cmd_buf.data.cmd.w + 1;
 
 #ifdef DEBUG_SHIFT
   printf("MPSSE: shift %d bytes (%d avail)\n", shift_len, len);
@@ -1087,7 +1207,7 @@ static uint16_t mpsse_shift_bytes(struct jtag *jtag, uint8_t *buf, uint16_t len)
     printf("Trunc write %d to %d\n", shift_len, len);
 #endif
 
-    pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf,
+    if(len) pio_jtag_write_tdi_read_tdo(&jtag->pio, (cmd&8)?1:0, buf,
 	    (cmd & 0x20)?(jtag->reply_buffer + jtag->reply_len + 2):NULL,len*8);
     if(cmd & 0x20) jtag->reply_len += len;
     jtag->pending_writes = shift_len-len;
@@ -1232,6 +1352,7 @@ static uint8_t mpsse_cmd_size(uint8_t cmd) {
 }
 
 static void mpsse_parse(struct jtag *jtag, uint8_t *buf, uint16_t len) {
+  if(!len) return;
   if(jtag->mode == 1) {
     printf("BITBANG\n");
 
@@ -1403,14 +1524,6 @@ int main(void) {
   // Wait until configured
   while(!configured) tight_loop_contents();
   
-  // get ready to tx to host
-  check_for_outgoing_data(&dev_config.ports[0].jtag);
-  check_for_outgoing_data(&dev_config.ports[1].jtag);
-  
-  // Get ready to rx from host
-  usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
-  usb_start_transfer(usb_get_endpoint_configuration(EP4_OUT_ADDR), NULL, 64);
-
   // led off
   gpio_put(PICO_DEFAULT_LED_PIN, 0);
   

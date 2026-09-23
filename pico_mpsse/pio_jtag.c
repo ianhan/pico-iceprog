@@ -45,11 +45,10 @@ static void dma_init(pio_jtag_inst_t* jtag) {
 			);
 }
 
-static void pio_wait_ready(pio_jtag_inst_t *jtag) {
+void pio_jtag_wait(pio_jtag_inst_t *jtag) {
   if(!jtag->pio_enabled) {
     // the pio must be enabled to actually shift data. This happens if e.g. data is being
     // sent in loopback mode as MPSSE is not setup then    
-    printf("---------> WARNING, PIO %d is not enabled\n", PIO_INDEX(jtag));
     return;
   }
   
@@ -63,7 +62,7 @@ static void pio_wait_ready(pio_jtag_inst_t *jtag) {
 }
 
 void pio_set_outputs(pio_jtag_inst_t *jtag, uint8_t bits) {
-  pio_wait_ready(jtag);
+  pio_jtag_wait(jtag);
 
   uint32_t pin_mask = (1<<jtag->pin_tdi) | (1<<jtag->pin_tms) | (1<<jtag->pin_tck);
   uint32_t pin_values =
@@ -71,14 +70,17 @@ void pio_set_outputs(pio_jtag_inst_t *jtag, uint8_t bits) {
     ((bits & PIO_JTAG_BIT_TMS)?(1<<jtag->pin_tms):0) |
     ((bits & PIO_JTAG_BIT_TCK)?(1<<jtag->pin_tck):0);
   
+  pio_sm_set_enabled(jtag->pio, jtag->sm, false);
   pio_sm_set_pins_with_mask(jtag->pio, jtag->sm, pin_values, pin_mask);
+  pio_sm_set_enabled(jtag->pio, jtag->sm, jtag->pio_enabled);
 }
 
 static void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const uint8_t *bsrc, uint8_t *bdst, size_t len) {
+  // iceprog sends command bytes and payload in separate USB writes.
+  if(!len) return;
   size_t byte_length = (len+7)/8;  // bytes needed for len bits
   size_t last_shift = ((byte_length << 3) - len);
   size_t tx_remain = (len+3)/4, rx_remain = last_shift ? byte_length : byte_length+1;
-  io_rw_8 *txfifo = (io_rw_8 *) &jtag->pio->txf[jtag->sm];
   static uint8_t x; // scratch local to receive data if no receive buffer is provided
 
   /* don't do anything if pio is not enabled at all */
@@ -87,7 +89,7 @@ static void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const
     return;
   }
   
-  pio_wait_ready(jtag);
+  pio_jtag_wait(jtag);
 
   pio_sm_put_blocking(jtag->pio, jtag->sm, len-1);
   
@@ -96,13 +98,17 @@ static void __time_critical_func(pio_jtag_blocking)(pio_jtag_inst_t *jtag, const
   dma_channel_set_config(jtag->rx_dma_chan, &jtag->rx_c, false);
   dma_channel_set_config(jtag->tx_dma_chan, &jtag->tx_c, false);
   
-  dma_channel_transfer_to_buffer_now(jtag->rx_dma_chan, (void*)(bdst?bdst:&x), rx_remain);
+  // The PIO program always pushes a final word. After a whole-byte transfer
+  // this is an empty trailer, not another byte belonging to the caller.
+  dma_channel_transfer_to_buffer_now(jtag->rx_dma_chan, (void*)(bdst?bdst:&x), bdst?byte_length:rx_remain);
 
   if(bdst)  {
     dma_channel_transfer_from_buffer_now(jtag->tx_dma_chan, (void*)bsrc, tx_remain);
     while (dma_channel_is_busy(jtag->rx_dma_chan)) tight_loop_contents();
+    if(!last_shift) (void)pio_sm_get_blocking(jtag->pio, jtag->sm);
   } else {
     // use buffer, so USB can already refill the current buffer 
+    assert(tx_remain <= sizeof(jtag->write_buffer));
     memcpy(jtag->write_buffer, bsrc, tx_remain);
     dma_channel_transfer_from_buffer_now(jtag->tx_dma_chan, jtag->write_buffer, tx_remain);  
     jtag->write_pending = true;
@@ -123,6 +129,7 @@ static uint16_t jtag_get_clk_divider(int freq_khz) {
 }
 
 void pio_jtag_set_clk_freq(pio_jtag_inst_t *jtag, uint freq_khz) {
+  pio_jtag_wait(jtag);
   pio_sm_set_clkdiv_int_frac(jtag->pio, jtag->sm, jtag_get_clk_divider(freq_khz), 0);
 }
 
@@ -131,18 +138,24 @@ static uint16_t interleave_table[256];
 static uint8_t reverse_table[256];
 
 void pio_jtag_enable(pio_jtag_inst_t* jtag, bool enable) {
-  if(jtag->pio_enabled == enable) return;  
-
-  printf("PIO #%d %sable\n", PIO_INDEX(jtag), enable?"en":"dis");
-
-  // make sure all data is transferred before disabling the PIO
-  if(!enable) pio_wait_ready(jtag);
+  // Also apply direction changes when PIO remains enabled (SPI leaves D3
+  // as an input, while JTAG uses it as the TMS output).
+  pio_jtag_wait(jtag);
+  pio_sm_set_enabled(jtag->pio, jtag->sm, false);
 
   if(enable) {
+    uint32_t outputs = (1u << jtag->pin_tck) | (1u << jtag->pin_tdi);
+    if(jtag->gpio_dir & 0x08) outputs |= 1u << jtag->pin_tms;
+    pio_sm_set_pindirs_with_mask(jtag->pio, jtag->sm, outputs,
+        (1u << jtag->pin_tck) | (1u << jtag->pin_tdi) |
+        (1u << jtag->pin_tms) | (1u << jtag->pin_tdo));
     int gpio_func_pio = PIO_INDEX(jtag)?GPIO_FUNC_PIO1:GPIO_FUNC_PIO0;
     gpio_set_function(jtag->pin_tdi, gpio_func_pio);
     gpio_set_function(jtag->pin_tms, gpio_func_pio);
     gpio_set_function(jtag->pin_tck, gpio_func_pio);
+    // TDO/MISO is sampled by PIO but stays muxed to SIO. Its SIO direction
+    // must therefore also be input after SET_BITMODE's initial output mask.
+    gpio_set_dir(jtag->pin_tdo, GPIO_IN);
   } else {    
     // revert to bitbang and set pin direction as requested
 
@@ -155,7 +168,8 @@ void pio_jtag_enable(pio_jtag_inst_t* jtag, bool enable) {
     gpio_set_function(jtag->pin_tdi, GPIO_FUNC_SIO);
     gpio_set_dir(jtag->pin_tdi, (jtag->gpio_dir&(1<<1))?GPIO_OUT:GPIO_IN);
 
-    // gpio 2 is input
+    gpio_set_function(jtag->pin_tdo, GPIO_FUNC_SIO);
+    gpio_set_dir(jtag->pin_tdo, (jtag->gpio_dir&(1<<2))?GPIO_OUT:GPIO_IN);
     
     gpio_put(jtag->pin_tms, gpio_get(jtag->pin_tms));
     gpio_set_function(jtag->pin_tms, GPIO_FUNC_SIO);
@@ -188,6 +202,7 @@ void pio_jtag_init(pio_jtag_inst_t* jtag, uint freq) {
 }
 
 void pio_jtag_write_tms(pio_jtag_inst_t* jtag, bool lsb, uint tdi, const uint8_t *src, uint8_t *dst, size_t len) {
+  if(!len) return;
   uint16_t wlen = (len+7)/8;
   uint16_t tx_buffer[wlen];  // bytes are expanded to words for interleaved two-bit-transmission
   uint16_t tdi_mask = tdi?0x5555:0x0000;
@@ -204,6 +219,7 @@ void pio_jtag_write_tms(pio_jtag_inst_t* jtag, bool lsb, uint tdi, const uint8_t
 }
 
 void pio_jtag_write_tdi_read_tdo(pio_jtag_inst_t* jtag, bool lsb, const uint8_t *src, uint8_t *dst, size_t len) {
+  if(!len) return;
   uint16_t wlen = (len+7)/8;
   uint16_t tx_buffer[wlen];  // bytes are expanded to words for interleaved two-bit-transmission
 
@@ -227,3 +243,18 @@ void pio_jtag_read_tdo(pio_jtag_inst_t* jtag, bool lsb, uint8_t *dst, size_t len
   pio_jtag_write_tdi_read_tdo(jtag, lsb, NULL, dst, len);
 }
 
+// MPSSE 0x8e/0x8f: clock without changing either data output or returning data.
+// Reuse the existing interleaved PIO engine in bounded USB-sized chunks.
+void pio_jtag_clock(pio_jtag_inst_t *jtag, size_t bits) {
+  pio_jtag_wait(jtag);
+  uint8_t pair = (gpio_get(jtag->pin_tdi)?1:0) |
+                 (gpio_get(jtag->pin_tms)?2:0);
+  uint8_t data[128];
+  memset(data, pair * 0x55, sizeof(data));
+  while(bits) {
+    size_t count = MIN(bits, sizeof(data) * 4);
+    pio_jtag_blocking(jtag, data, NULL, count);
+    bits -= count;
+  }
+  pio_jtag_wait(jtag);
+}

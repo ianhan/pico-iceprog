@@ -40,9 +40,10 @@ struct jtag {
   uint16_t reply_len;
   uint8_t reply_buffer[REPLY_BUFFER_SIZE];
   uint8_t eps[2];
-  uint16_t pending_writes;
+  uint32_t pending_writes;
   uint8_t pending_write_cmd;
   uint8_t mode;  // 2=MPSSE
+  uint8_t latency_timer;
 
   // command buffer to assemble incoming mpsse commands
   // which may be split over multiple usb transfers

@@ -1,5 +1,9 @@
 # Pico MPPSE
 
+These are the retained upstream PICO-MPSSE notes. For this fork's iceprog
+support, `pico_iceprog.uf2` build, wiring and validation status, see the
+[project README](../README.md).
+
 This is a MPSSE compatible JTAG implementation for the Raspberry Pi
 Pico's RP2040 MCU. It allows to use the Raspberry Pi Pico as a
 replacement for the MPSSE devices and use the Pico e.g. as a flash

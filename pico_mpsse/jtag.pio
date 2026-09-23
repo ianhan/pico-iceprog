@@ -47,6 +47,7 @@ static inline void pio_jtag_io_init(PIO pio, uint sm,
     pio_gpio_init(pio, pin_tdi);
     pio_gpio_init(pio, pin_tms);
     pio_gpio_init(pio, pin_tck);
+    gpio_init(pin_tdo);
 
     // jtag is synchronous, so bypass input synchroniser to reduce input delay.
     hw_set_bits(&pio->input_sync_bypass, 1u << pin_tdo);
