@@ -136,6 +136,14 @@ static void loopback(uint p, size_t bytes, size_t packet) {
 int main(void) {
   start(); model_loopback = true;
   uint8_t reply[64];
+  // Releasing an open-drain control must not leave the RP2040's reset
+  // pull-down fighting the target's weak pull-up, particularly on CDONE.
+  const uint control_pins[] = {6, 7, 8, 9, 20, 21, 22, 26};
+  for(size_t i=0; i<sizeof(control_pins)/sizeof(control_pins[0]); i++) {
+    assert(!model_output(control_pins[i]));
+    assert(!model_pull_up(control_pins[i]));
+    assert(!model_pull_down(control_pins[i]));
+  }
   assert(control(USB_DIR_IN,USB_REQUEST_GET_CONFIGURATION,0,0,reply,1)==1 && reply[0]==1);
   assert(control(USB_DIR_IN,USB_REQUEST_GET_DESCRIPTOR,USB_DT_CONFIG<<8,0,reply,64)==55);
   for(uint p=0;p<2;p++) {

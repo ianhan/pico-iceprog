@@ -8,3 +8,5 @@ extern bool model_loopback, model_power_down;
 void model_init(void);
 void model_save(void);
 bool model_output(uint pin);
+bool model_pull_up(uint pin);
+bool model_pull_down(uint pin);

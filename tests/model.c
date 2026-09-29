@@ -8,6 +8,7 @@ uint8_t model_flash[FLASH_SIZE], model_sr[2], model_sram[FLASH_SIZE];
 size_t model_sram_bits, model_two_bit_resets;
 bool model_loopback, model_power_down;
 static bool values[32], outputs[32];
+static bool pull_ups[32], pull_downs[32];
 static uint functions[32];
 static const uint cs_pins[] = {6, 20}, reset_pins[] = {9, 26};
 static struct {
@@ -30,6 +31,8 @@ bool model_output(uint pin) {
   assert(pin < 32);
   return functions[pin] ? !!(fake_pios[functions[pin]-1].directions & (1u << pin)) : outputs[pin];
 }
+bool model_pull_up(uint pin) { assert(pin < 32); return pull_ups[pin]; }
+bool model_pull_down(uint pin) { assert(pin < 32); return pull_downs[pin]; }
 bool gpio_get(uint pin) {
   assert(pin < 32);
   if(!model_output(pin)) return true; // target pull-ups, including CDONE
@@ -69,7 +72,9 @@ void gpio_init(uint pin) { assert(pin < 32); functions[pin] = 0; outputs[pin] = 
 void gpio_set_dir(uint pin, bool out) { bool before = gpio_get(pin); outputs[pin] = out; pin_changed(pin, before); }
 void gpio_put(uint pin, bool value) { bool before = gpio_get(pin); values[pin] = value; pin_changed(pin, before); }
 void gpio_set_function(uint pin, uint function) { assert(pin < 32); functions[pin] = function; }
-void gpio_set_pulls(uint pin, bool up, bool down) { (void)pin; (void)up; (void)down; }
+void gpio_set_pulls(uint pin, bool up, bool down) {
+  assert(pin < 32); pull_ups[pin] = up; pull_downs[pin] = down;
+}
 void pio_sm_set_enabled(PIO p, uint sm, bool enabled) { (void)sm; p->enabled = enabled; }
 void pio_sm_set_pins_with_mask(PIO p, uint sm, uint32_t v, uint32_t m) { (void)sm; p->values = (p->values & ~m) | (v & m); }
 void pio_sm_set_pindirs_with_mask(PIO p, uint sm, uint32_t v, uint32_t m) { (void)sm; p->directions = (p->directions & ~m) | (v & m); }
@@ -184,6 +189,9 @@ bool dma_channel_is_busy(int n) {
 }
 
 void model_init(void) {
+  // RP2040 PADS_BANK0 GPIO reset: PUE=0, PDE=1. gpio_init does not alter it.
+  memset(pull_ups, 0, sizeof(pull_ups));
+  memset(pull_downs, 1, sizeof(pull_downs));
   memset(model_flash, 0xff, sizeof(model_flash));
   if(getenv("TEST_PROTECTED")) model_sr[0] = 0x1c;
   const char *path = getenv("TEST_FLASH");

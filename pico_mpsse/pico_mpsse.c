@@ -1499,6 +1499,10 @@ void jtag_init(pio_jtag_inst_t* jtag_pio) {
 
       // by default the pins are inputs
       gpio_init(jtag_pio->pins_upper[i]);
+      // RP2040 pads reset with pull-down enabled; gpio_init() preserves it.
+      // CS/CRESET are released as inputs, and CDONE is an open-drain target
+      // output with a weak pull-up. Do not load those target pull-ups.
+      gpio_set_pulls(jtag_pio->pins_upper[i], false, false);
       gpio_set_dir(jtag_pio->pins_upper[i], GPIO_IN);      
     }
   }
